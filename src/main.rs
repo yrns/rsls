@@ -1,12 +1,21 @@
 use lsp_server::{Connection, Message, Notification, Request, RequestId, Response};
 use lsp_types::{
-    notification::{DidChangeTextDocument, DidCloseTextDocument, DidOpenTextDocument},
-    GotoDefinitionResponse, InitializeParams, Position, Range, ServerCapabilities,
-    TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions, TextEdit,
+    notification::{
+        DidChangeConfiguration, DidChangeTextDocument, DidCloseTextDocument, DidOpenTextDocument,
+    },
+    DidChangeConfigurationParams, GotoDefinitionResponse, InitializeParams, Position, Range,
+    ServerCapabilities, TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
+    TextEdit,
 };
 use ropey::Rope;
+use serde::Deserialize;
 use sqlformat::{FormatOptions, QueryParams};
 use std::{collections::HashMap, error::Error};
+
+#[derive(Deserialize, Debug)]
+struct Settings {
+    databases: Vec<String>,
+}
 
 fn main() -> Result<(), Box<dyn Error + Sync + Send>> {
     // Note that  we must have our logging only write out to stderr.
@@ -43,6 +52,7 @@ fn main_loop(
 ) -> Result<(), Box<dyn Error + Sync + Send>> {
     let _params: InitializeParams = serde_json::from_value(params).unwrap();
     let mut docs: HashMap<lsp_types::Url, (i32, Rope)> = HashMap::new();
+    let mut conns: Vec<rusqlite::Connection> = Vec::new();
 
     eprintln!("starting example main loop");
 
@@ -135,9 +145,24 @@ fn main_loop(
                     Err(not) => not,
                 };
 
-                let _not = match castn::<DidCloseTextDocument>(not) {
+                let not = match castn::<DidCloseTextDocument>(not) {
                     Ok(params) => {
                         docs.remove(&params.text_document.uri);
+                        continue;
+                    }
+                    Err(not) => not,
+                };
+
+                let _not = match castn::<DidChangeConfiguration>(not) {
+                    Ok(params) => {
+                        let settings = params.settings.get("rsls").unwrap();
+                        let settings: Settings = serde_json::from_value(settings.clone()).unwrap();
+                        // make connections
+                        conns.clear();
+                        for s in settings.databases.iter() {
+                            conns.push(rusqlite::Connection::open(s).unwrap());
+                        }
+
                         continue;
                     }
                     Err(not) => not,
