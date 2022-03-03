@@ -2,10 +2,11 @@ use lsp_server::{Connection, Message, Notification, Request, RequestId, Response
 use lsp_types::{
     notification::{
         DidChangeConfiguration, DidChangeTextDocument, DidCloseTextDocument, DidOpenTextDocument,
+        Notification as _, PublishDiagnostics,
     },
-    DidChangeConfigurationParams, GotoDefinitionResponse, InitializeParams, Position, Range,
-    ServerCapabilities, TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
-    TextEdit,
+    Diagnostic, DiagnosticSeverity, DidChangeConfigurationParams, GotoDefinitionResponse,
+    InitializeParams, Position, PublishDiagnosticsParams, Range, ServerCapabilities,
+    TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions, TextEdit, Url,
 };
 use ropey::Rope;
 use serde::Deserialize;
@@ -44,6 +45,26 @@ fn main() -> Result<(), Box<dyn Error + Sync + Send>> {
     // Shut down gracefully.
     eprintln!("shutting down server");
     Ok(())
+}
+
+fn publish_diagnostics(conn: &rusqlite::Connection, sql: &str, uri: &Url) -> Message {
+    let d = conn.prepare(sql).err().map(|err| {
+        Diagnostic {
+            //range: sqlite3_error_offset?
+            severity: Some(DiagnosticSeverity::ERROR),
+            message: err.to_string(),
+            ..Default::default()
+        }
+    });
+
+    Message::Notification(Notification::new(
+        PublishDiagnostics::METHOD.into(),
+        PublishDiagnosticsParams {
+            uri: uri.clone(),
+            diagnostics: d.into_iter().collect(),
+            version: None,
+        },
+    ))
 }
 
 fn main_loop(
@@ -118,9 +139,20 @@ fn main_loop(
                     Ok(params) => {
                         let rope = Rope::from_str(&params.text_document.text);
                         docs.insert(
-                            params.text_document.uri,
+                            params.text_document.uri.clone(),
                             (params.text_document.version, rope),
                         );
+
+                        if let Some(c) = conns.first() {
+                            connection
+                                .sender
+                                .send(publish_diagnostics(
+                                    c,
+                                    &params.text_document.text,
+                                    &params.text_document.uri,
+                                ))
+                                .unwrap();
+                        }
                         continue;
                     }
                     Err(not) => not,
@@ -134,6 +166,16 @@ fn main_loop(
                                     let rope = Rope::from_str(&change.text);
                                     // make sure range is None?
                                     *text = rope;
+                                }
+                                if let Some(c) = conns.first() {
+                                    connection
+                                        .sender
+                                        .send(publish_diagnostics(
+                                            c,
+                                            &text.slice(..).to_string(),
+                                            &params.text_document.uri,
+                                        ))
+                                        .unwrap();
                                 }
                             }
                             None => {
