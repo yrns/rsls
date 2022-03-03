@@ -47,10 +47,19 @@ fn main() -> Result<(), Box<dyn Error + Sync + Send>> {
     Ok(())
 }
 
-fn publish_diagnostics(conn: &rusqlite::Connection, sql: &str, uri: &Url) -> Message {
-    let d = conn.prepare(sql).err().map(|err| {
+fn publish_diagnostics(conn: &rusqlite::Connection, rope: &Rope, uri: &Url) -> Message {
+    let sql = rope.slice(..).to_string();
+    let d = conn.prepare(&sql).err().map(|err| {
+        let offset = unsafe { rusqlite::ffi::sqlite3_error_offset(conn.handle()) };
+        eprintln!("offset: {}", offset);
+        let range = if offset >= 0 {
+            let offset = offset as usize;
+            range(rope, offset..rope.len_chars())
+        } else {
+            Range::default()
+        };
         Diagnostic {
-            //range: sqlite3_error_offset?
+            range,
             severity: Some(DiagnosticSeverity::ERROR),
             message: err.to_string(),
             ..Default::default()
@@ -138,21 +147,19 @@ fn main_loop(
                 let not = match castn::<DidOpenTextDocument>(not) {
                     Ok(params) => {
                         let rope = Rope::from_str(&params.text_document.text);
+
+                        if let Some(c) = conns.first() {
+                            connection
+                                .sender
+                                .send(publish_diagnostics(c, &rope, &params.text_document.uri))
+                                .unwrap();
+                        }
+
                         docs.insert(
                             params.text_document.uri.clone(),
                             (params.text_document.version, rope),
                         );
 
-                        if let Some(c) = conns.first() {
-                            connection
-                                .sender
-                                .send(publish_diagnostics(
-                                    c,
-                                    &params.text_document.text,
-                                    &params.text_document.uri,
-                                ))
-                                .unwrap();
-                        }
                         continue;
                     }
                     Err(not) => not,
@@ -172,7 +179,7 @@ fn main_loop(
                                         .sender
                                         .send(publish_diagnostics(
                                             c,
-                                            &text.slice(..).to_string(),
+                                            &text,
                                             &params.text_document.uri,
                                         ))
                                         .unwrap();
