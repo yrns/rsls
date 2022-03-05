@@ -1,21 +1,63 @@
+use fallible_iterator::FallibleIterator;
 use lsp_server::{Connection, Message, Notification, Request, RequestId, Response};
 use lsp_types::{
     notification::{
         DidChangeConfiguration, DidChangeTextDocument, DidCloseTextDocument, DidOpenTextDocument,
         Notification as _, PublishDiagnostics,
     },
-    Diagnostic, DiagnosticSeverity, DidChangeConfigurationParams, GotoDefinitionResponse,
-    InitializeParams, Position, PublishDiagnosticsParams, Range, ServerCapabilities,
-    TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions, TextEdit, Url,
+    Diagnostic, DiagnosticSeverity, GotoDefinitionResponse, Hover, HoverContents,
+    HoverProviderCapability, InitializeParams, MarkupContent, MarkupKind, Position,
+    PublishDiagnosticsParams, Range, ServerCapabilities, TextDocumentSyncCapability,
+    TextDocumentSyncKind, TextDocumentSyncOptions, TextEdit, Url,
 };
 use ropey::Rope;
 use serde::Deserialize;
 use sqlformat::{FormatOptions, QueryParams};
+use sqlite3_parser::{
+    ast::Cmd,
+    lexer::{sql::Error as ParseError, sql::Parser, InputStream},
+};
 use std::{collections::HashMap, error::Error};
 
 #[derive(Deserialize, Debug)]
 struct Settings {
     databases: Vec<String>,
+}
+
+struct Doc {
+    version: i32,
+    rope: Rope,
+    ast: Option<Result<Vec<(Cmd, Range)>, ParseError>>,
+}
+
+impl Doc {
+    fn parse(&mut self) {
+        // impl Input?
+        let s = self.rope.slice(..).to_string();
+        let input = InputStream::new(s.as_bytes());
+        let mut parser = Parser::new(input);
+        let mut cmds = Vec::new();
+        let pos = |p: &Parser<_>| Position::new((p.line() - 1) as u32, p.column() as u32);
+
+        loop {
+            // these positions are off because they include white
+            // space surrounding statements - line here is 1-based
+            let start = pos(&parser);
+            match parser.next() {
+                Ok(None) => {
+                    self.ast = Some(Ok(cmds));
+                    return;
+                }
+                Err(err) => {
+                    self.ast = Some(Err(err));
+                    return;
+                }
+                Ok(Some(cmd)) => {
+                    cmds.push((cmd, Range::new(start, pos(&parser))));
+                }
+            }
+        }
+    }
 }
 
 fn main() -> Result<(), Box<dyn Error + Sync + Send>> {
@@ -37,6 +79,7 @@ fn main() -> Result<(), Box<dyn Error + Sync + Send>> {
         save: None,
     }));
     caps.document_formatting_provider = Some(lsp_types::OneOf::Left(true));
+    caps.hover_provider = Some(HoverProviderCapability::Simple(true));
     let server_capabilities = serde_json::to_value(&caps).unwrap();
     let initialization_params = connection.initialize(server_capabilities)?;
     main_loop(connection, initialization_params)?;
@@ -81,7 +124,7 @@ fn main_loop(
     params: serde_json::Value,
 ) -> Result<(), Box<dyn Error + Sync + Send>> {
     let _params: InitializeParams = serde_json::from_value(params).unwrap();
-    let mut docs: HashMap<lsp_types::Url, (i32, Rope)> = HashMap::new();
+    let mut docs: HashMap<lsp_types::Url, Doc> = HashMap::new();
     let mut conns: Vec<rusqlite::Connection> = Vec::new();
 
     eprintln!("starting example main loop");
@@ -110,17 +153,17 @@ fn main_loop(
                     Err(req) => req,
                 };
 
-                let _req = match cast::<lsp_types::request::Formatting>(req) {
+                let req = match cast::<lsp_types::request::Formatting>(req) {
                     Ok((id, params)) => {
-                        if let Some((_v, text)) = docs.get(&params.text_document.uri) {
-                            let query = text.slice(..).to_string();
+                        if let Some(doc) = docs.get(&params.text_document.uri) {
+                            let query = doc.rope.slice(..).to_string();
                             let new_text = sqlformat::format(
                                 &query,
                                 &QueryParams::None,
                                 FormatOptions::default(),
                             );
                             let result = TextEdit {
-                                range: range(text, 0..text.len_chars()),
+                                range: range(&doc.rope, 0..doc.rope.len_chars()),
                                 new_text,
                             };
                             let result = Some(vec![result]);
@@ -131,6 +174,37 @@ fn main_loop(
                                 error: None,
                             };
                             connection.sender.send(Message::Response(resp))?;
+                        }
+                        continue;
+                    }
+                    Err(req) => req,
+                };
+
+                let _req = match cast::<lsp_types::request::HoverRequest>(req) {
+                    Ok((id, params)) => {
+                        let position = params.text_document_position_params.position;
+                        let uri = params.text_document_position_params.text_document.uri;
+
+                        if let Some(doc) = docs.get(&uri) {
+                            if let Some(Ok(cmds)) = &doc.ast {
+                                if let Some((cmd, _)) =
+                                    cmds.iter().find(|(_, range)| in_range(*range, position))
+                                {
+                                    connection
+                                        .sender
+                                        .send(Message::Response(Response::new_ok(
+                                            id,
+                                            Hover {
+                                                contents: HoverContents::Markup(MarkupContent {
+                                                    kind: MarkupKind::Markdown,
+                                                    value: format!("[{:?}]", cmd),
+                                                }),
+                                                range: Default::default(),
+                                            },
+                                        )))
+                                        .unwrap();
+                                }
+                            }
                         }
                         continue;
                     }
@@ -155,10 +229,15 @@ fn main_loop(
                                 .unwrap();
                         }
 
-                        docs.insert(
-                            params.text_document.uri.clone(),
-                            (params.text_document.version, rope),
-                        );
+                        let mut doc = Doc {
+                            version: params.text_document.version,
+                            rope,
+                            ast: None,
+                        };
+
+                        doc.parse();
+
+                        docs.insert(params.text_document.uri.clone(), doc);
 
                         continue;
                     }
@@ -168,18 +247,21 @@ fn main_loop(
                 let not = match castn::<DidChangeTextDocument>(not) {
                     Ok(params) => {
                         match docs.get_mut(&params.text_document.uri) {
-                            Some((_v, text)) => {
+                            Some(doc) => {
                                 for change in params.content_changes {
                                     let rope = Rope::from_str(&change.text);
                                     // make sure range is None?
-                                    *text = rope;
+                                    doc.rope = rope;
+                                    doc.parse();
                                 }
+                                // TODO: use parse error for
+                                // diagnostics - also send on open?
                                 if let Some(c) = conns.first() {
                                     connection
                                         .sender
                                         .send(publish_diagnostics(
                                             c,
-                                            &text,
+                                            &doc.rope,
                                             &params.text_document.uri,
                                         ))
                                         .unwrap();
@@ -232,6 +314,10 @@ fn range(rope: &Rope, range: std::ops::Range<usize>) -> Range {
     Range::new(position(rope, range.start), position(rope, range.end))
 }
 
+fn in_range(r: Range, p: Position) -> bool {
+    p >= r.start && p <= r.end
+}
+
 fn cast<R>(req: Request) -> Result<(RequestId, R::Params), Request>
 where
     R: lsp_types::request::Request,
@@ -246,4 +332,28 @@ where
     N::Params: serde::de::DeserializeOwned,
 {
     not.extract(N::METHOD)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse() {
+        let mut doc = Doc {
+            version: 1,
+            rope: Rope::from_str("select * from foo; select * from baz;"),
+            ast: None,
+        };
+        doc.parse();
+        assert_eq!(
+            match doc.ast {
+                Some(Ok(ref v)) => v.len(),
+                _ => 0,
+            },
+            2,
+            "expecting 2 statements: {:?}",
+            doc.ast
+        );
+    }
 }
