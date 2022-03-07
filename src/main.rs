@@ -222,24 +222,56 @@ fn main() -> Result<(), Box<dyn Error + Sync + Send>> {
     Ok(())
 }
 
-fn publish_diagnostics(conn: &rusqlite::Connection, rope: &Rope, uri: &Url) -> Message {
-    let sql = rope.slice(..).to_string();
-    let d = conn.prepare(&sql).err().map(|err| {
-        let offset = unsafe { rusqlite::ffi::sqlite3_error_offset(conn.handle()) };
-        eprintln!("offset: {}", offset);
-        let range = if offset >= 0 {
-            let offset = offset as usize;
-            range(rope, offset..rope.len_chars())
-        } else {
-            Range::default()
-        };
-        Diagnostic {
-            range,
-            severity: Some(DiagnosticSeverity::ERROR),
-            message: err.to_string(),
-            ..Default::default()
+fn publish_diagnostics(conn: &rusqlite::Connection, doc: &Doc, uri: &Url) -> Message {
+    // use the results of the parse before sending to sqlite
+    let d = match &doc.ast {
+        Some(Err(err)) => {
+            let range = match err {
+                ParseError::UnrecognizedToken(Some(pos))
+                | ParseError::UnterminatedLiteral(Some(pos))
+                | ParseError::UnterminatedBracket(Some(pos))
+                | ParseError::UnterminatedBlockComment(Some(pos))
+                | ParseError::BadVariableName(Some(pos))
+                | ParseError::BadNumber(Some(pos))
+                | ParseError::ExpectedEqualsSign(Some(pos))
+                | ParseError::MalformedBlobLiteral(Some(pos))
+                | ParseError::MalformedHexInteger(Some(pos))
+                | ParseError::SyntaxError(_, Some(pos)) => {
+                    let line: u32 = (pos.0 - 1).try_into().unwrap();
+                    let col: u32 = pos.1.try_into().unwrap();
+                    // extend to end of line
+                    Range::new(Position::new(line, col), Position::new(line, u32::MAX))
+                }
+                _ => Default::default(),
+            };
+
+            Some(Diagnostic {
+                range,
+                severity: Some(DiagnosticSeverity::ERROR),
+                message: err.to_string(),
+                ..Default::default()
+            })
         }
-    });
+        _ => {
+            let sql = doc.rope.slice(..).to_string();
+            conn.prepare(&sql).err().map(|err| {
+                let offset = unsafe { rusqlite::ffi::sqlite3_error_offset(conn.handle()) };
+                eprintln!("offset: {}", offset);
+                let range = if offset >= 0 {
+                    let offset = offset as usize;
+                    range(&doc.rope, offset..doc.rope.len_chars())
+                } else {
+                    Range::default()
+                };
+                Diagnostic {
+                    range,
+                    severity: Some(DiagnosticSeverity::ERROR),
+                    message: err.to_string(),
+                    ..Default::default()
+                }
+            })
+        }
+    };
 
     Message::Notification(Notification::new(
         PublishDiagnostics::METHOD.into(),
@@ -370,7 +402,7 @@ fn main_loop(
                         if let Some(c) = conns.first() {
                             connection
                                 .sender
-                                .send(publish_diagnostics(c, &doc.rope, &params.text_document.uri))
+                                .send(publish_diagnostics(c, &doc, &params.text_document.uri))
                                 .unwrap();
 
                             doc.set_hover_info(c);
@@ -402,7 +434,7 @@ fn main_loop(
                                         .sender
                                         .send(publish_diagnostics(
                                             c,
-                                            &doc.rope,
+                                            &doc,
                                             &params.text_document.uri,
                                         ))
                                         .unwrap();
