@@ -1,4 +1,5 @@
 use fallible_iterator::FallibleIterator;
+use itertools::Itertools;
 use lsp_server::{Connection, Message, Notification, Request, RequestId, Response};
 use lsp_types::{
     notification::{
@@ -14,7 +15,7 @@ use ropey::Rope;
 use serde::Deserialize;
 use sqlformat::{FormatOptions, QueryParams};
 use sqlite3_parser::{
-    ast::Cmd,
+    ast::{As, Cmd, Expr, Id, Name, OneSelect, ResultColumn, SelectTable, Stmt},
     lexer::{sql::Error as ParseError, sql::Parser, InputStream},
 };
 use std::{collections::HashMap, error::Error};
@@ -27,7 +28,7 @@ struct Settings {
 struct Doc {
     version: i32,
     rope: Rope,
-    ast: Option<Result<Vec<(Cmd, Range)>, ParseError>>,
+    ast: Option<Result<Vec<(Cmd, Range, Option<String>)>, ParseError>>,
 }
 
 impl Doc {
@@ -53,10 +54,141 @@ impl Doc {
                     return;
                 }
                 Ok(Some(cmd)) => {
-                    cmds.push((cmd, Range::new(start, pos(&parser))));
+                    cmds.push((cmd, Range::new(start, pos(&parser)), None));
                 }
             }
         }
+    }
+
+    fn set_hover_info(&mut self, conn: &rusqlite::Connection) {
+        if let Some(Ok(cmds)) = &mut self.ast {
+            for (cmd, _, ref mut info) in cmds {
+                *info = hover_info(conn, &cmd);
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ColumnInfo {
+    //name: String,
+    ty: Option<String>,
+    notnull: bool,
+    default: Option<String>,
+    pk: bool,
+}
+
+impl std::fmt::Display for ColumnInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "ty: {:?} notnull: {} default: {:?} pk: {}",
+            self.ty, self.notnull, self.default, self.pk
+        )
+    }
+}
+
+// find column info for columns used by cmd
+#[allow(unstable_name_collisions)]
+fn hover_info(conn: &rusqlite::Connection, cmd: &Cmd) -> Option<String> {
+    let mut pragma = conn.prepare("select * from pragma_table_info(?);").unwrap();
+
+    match cmd {
+        // TODO: insert/update
+        Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt) | Cmd::Stmt(stmt) => match stmt {
+            Stmt::Insert {
+                tbl_name: _,
+                columns: _,
+                ..
+            } => None,
+            Stmt::Select(select) => match &select.body.select {
+                OneSelect::Select {
+                    columns,
+                    from: Some(from),
+                    ..
+                } => {
+                    let name_alias = |t: &SelectTable| match t {
+                        SelectTable::Table(name, alias, _) => Some((
+                            name.name.0.clone(),
+                            alias.as_ref().and_then(|a| match a {
+                                As::As(alias) => Some(alias.0.clone()),
+                                _ => None,
+                            }),
+                        )),
+                        _ => None,
+                    };
+
+                    let table = from.select.iter().filter_map(|t| name_alias(t.as_ref()));
+
+                    let joins = from
+                        .joins
+                        .iter()
+                        .flatten()
+                        .filter_map(|t| name_alias(&t.table));
+
+                    let tables: Vec<_> = table
+                        .chain(joins)
+                        .map(|(name, alias)| {
+                            let column_info: HashMap<String, ColumnInfo> = pragma
+                                .query_map(&[&name], |row| {
+                                    let name: String = row.get(1)?;
+                                    Ok((
+                                        name,
+                                        ColumnInfo {
+                                            // this does not do None (ever)?
+                                            ty: row.get(2)?,
+                                            notnull: row.get(3)?,
+                                            default: row.get(4)?,
+                                            pk: row.get(5)?,
+                                        },
+                                    ))
+                                })
+                                .unwrap()
+                                // this just discards errors?
+                                //.flatten()
+                                .filter_map(|res| match res {
+                                    Ok(pair) => Some(pair),
+                                    Err(err) => {
+                                        eprintln!("error in query_map: {}", err);
+                                        None
+                                    }
+                                })
+                                .collect();
+
+                            (name, alias, column_info)
+                        })
+                        .collect();
+
+                    //eprintln!("tables {:?}", tables);
+
+                    // TODO: this is not FromIterator for Option<_>
+                    match columns
+                        .iter()
+                        .filter_map(|c| match c {
+                            ResultColumn::Expr(expr, _) => match expr {
+                                Expr::Id(Id(col)) => tables
+                                    .first()
+                                    .and_then(|(_, _, cols)| cols.get(col))
+                                    .map(|info| (col, info)),
+                                Expr::Qualified(Name(table), Name(col)) => todo!(),
+                                _ => None,
+                            },
+                            _ => None,
+                        })
+                        .map(|(col, info)| format!("{}: [{}]", col, info))
+                        .intersperse(", ".to_string())
+                        .collect::<String>()
+                        .as_str()
+                    {
+                        "" => None,
+                        a => Some(a.to_string()),
+                    }
+                }
+                _ => None,
+            },
+            Stmt::Update { tbl_name, sets, .. } => None,
+            _ => None,
+        },
     }
 }
 
@@ -187,22 +319,27 @@ fn main_loop(
 
                         if let Some(doc) = docs.get(&uri) {
                             if let Some(Ok(cmds)) = &doc.ast {
-                                if let Some((cmd, _)) =
-                                    cmds.iter().find(|(_, range)| in_range(*range, position))
+                                if let Some((_, _, hover_info)) =
+                                    cmds.iter().find(|(_, range, _)| in_range(*range, position))
                                 {
-                                    connection
-                                        .sender
-                                        .send(Message::Response(Response::new_ok(
-                                            id,
-                                            Hover {
-                                                contents: HoverContents::Markup(MarkupContent {
-                                                    kind: MarkupKind::Markdown,
-                                                    value: format!("[{:?}]", cmd),
-                                                }),
-                                                range: Default::default(),
-                                            },
-                                        )))
-                                        .unwrap();
+                                    //eprintln!("hover_info: {:?}", hover_info);
+                                    if let Some(hover_info) = hover_info {
+                                        connection
+                                            .sender
+                                            .send(Message::Response(Response::new_ok(
+                                                id,
+                                                Hover {
+                                                    contents: HoverContents::Markup(
+                                                        MarkupContent {
+                                                            kind: MarkupKind::PlainText,
+                                                            value: hover_info.clone(),
+                                                        },
+                                                    ),
+                                                    range: Default::default(),
+                                                },
+                                            )))
+                                            .unwrap();
+                                    }
                                 }
                             }
                         }
@@ -222,13 +359,6 @@ fn main_loop(
                     Ok(params) => {
                         let rope = Rope::from_str(&params.text_document.text);
 
-                        if let Some(c) = conns.first() {
-                            connection
-                                .sender
-                                .send(publish_diagnostics(c, &rope, &params.text_document.uri))
-                                .unwrap();
-                        }
-
                         let mut doc = Doc {
                             version: params.text_document.version,
                             rope,
@@ -236,6 +366,15 @@ fn main_loop(
                         };
 
                         doc.parse();
+
+                        if let Some(c) = conns.first() {
+                            connection
+                                .sender
+                                .send(publish_diagnostics(c, &doc.rope, &params.text_document.uri))
+                                .unwrap();
+
+                            doc.set_hover_info(c);
+                        }
 
                         docs.insert(params.text_document.uri.clone(), doc);
 
@@ -252,11 +391,13 @@ fn main_loop(
                                     let rope = Rope::from_str(&change.text);
                                     // make sure range is None?
                                     doc.rope = rope;
-                                    doc.parse();
                                 }
+                                doc.parse();
                                 // TODO: use parse error for
                                 // diagnostics - also send on open?
                                 if let Some(c) = conns.first() {
+                                    doc.set_hover_info(c);
+
                                     connection
                                         .sender
                                         .send(publish_diagnostics(

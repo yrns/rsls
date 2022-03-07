@@ -468,6 +468,7 @@ name = "rsls"
 version = "0.1.0"
 dependencies = [
  "fallible-iterator",
+ "itertools",
  "lsp-server",
  "lsp-types",
  "ropey",
