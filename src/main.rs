@@ -6,6 +6,7 @@ use lsp_types::{
         DidChangeConfiguration, DidChangeTextDocument, DidCloseTextDocument, DidOpenTextDocument,
         Notification as _, PublishDiagnostics,
     },
+    CompletionItem, CompletionItemKind, CompletionList, CompletionOptions, CompletionResponse,
     Diagnostic, DiagnosticSeverity, GotoDefinitionResponse, Hover, HoverContents,
     HoverProviderCapability, InitializeParams, MarkupContent, MarkupKind, Position,
     PublishDiagnosticsParams, Range, ServerCapabilities, TextDocumentSyncCapability,
@@ -19,6 +20,10 @@ use sqlite3_parser::{
     lexer::{sql::Error as ParseError, sql::Parser, InputStream},
 };
 use std::{collections::HashMap, error::Error};
+
+use crate::keywords::KEYWORDS;
+
+mod keywords;
 
 #[derive(Deserialize, Debug)]
 struct Settings {
@@ -212,6 +217,14 @@ fn main() -> Result<(), Box<dyn Error + Sync + Send>> {
     }));
     caps.document_formatting_provider = Some(lsp_types::OneOf::Left(true));
     caps.hover_provider = Some(HoverProviderCapability::Simple(true));
+    caps.completion_provider = Some(CompletionOptions {
+        resolve_provider: None,
+        trigger_characters: None,
+        all_commit_characters: None,
+        work_done_progress_options: lsp_types::WorkDoneProgressOptions {
+            work_done_progress: None,
+        },
+    });
     let server_capabilities = serde_json::to_value(&caps).unwrap();
     let initialization_params = connection.initialize(server_capabilities)?;
     main_loop(connection, initialization_params)?;
@@ -290,8 +303,22 @@ fn main_loop(
     let _params: InitializeParams = serde_json::from_value(params).unwrap();
     let mut docs: HashMap<lsp_types::Url, Doc> = HashMap::new();
     let mut conns: Vec<rusqlite::Connection> = Vec::new();
+    let mut completions: Vec<CompletionItem> = Vec::new();
 
-    eprintln!("starting example main loop");
+    // docs?
+    let keywords: Vec<_> = KEYWORDS
+        .iter()
+        .map(|k| CompletionItem {
+            label: k.to_string(),
+            // lsp-mode uses the kind already
+            //detail: Some(format!("{} (keyword)", k)),
+            insert_text: Some(k.to_string()),
+            kind: Some(CompletionItemKind::KEYWORD),
+            ..Default::default()
+        })
+        .collect();
+
+    eprintln!("starting main loop");
 
     for msg in &connection.receiver {
         eprintln!("got msg: {:?}", msg);
@@ -344,7 +371,7 @@ fn main_loop(
                     Err(req) => req,
                 };
 
-                let _req = match cast::<lsp_types::request::HoverRequest>(req) {
+                let req = match cast::<lsp_types::request::HoverRequest>(req) {
                     Ok((id, params)) => {
                         let position = params.text_document_position_params.position;
                         let uri = params.text_document_position_params.text_document.uri;
@@ -375,6 +402,27 @@ fn main_loop(
                                 }
                             }
                         }
+                        continue;
+                    }
+                    Err(req) => req,
+                };
+
+                let _req = match cast::<lsp_types::request::Completion>(req) {
+                    Ok((id, _params)) => {
+                        connection
+                            .sender
+                            .send(Message::Response(Response::new_ok(
+                                id,
+                                CompletionResponse::List(CompletionList {
+                                    is_incomplete: false,
+                                    items: keywords
+                                        .iter()
+                                        .chain(completions.iter())
+                                        .cloned()
+                                        .collect(),
+                                }),
+                            )))
+                            .unwrap();
                         continue;
                     }
                     Err(req) => req,
