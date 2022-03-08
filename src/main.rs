@@ -515,6 +515,30 @@ fn main_loop(
                             conns.push(rusqlite::Connection::open(s).unwrap());
                         }
 
+                        // read completions from sqlite
+                        if let Some(c) = conns.first() {
+                            completions.clear();
+
+                            // functions
+                            let mut stmt = c.prepare("select name, builtin, enc, narg, flags from pragma_function_list;").unwrap();
+                            let rows = stmt
+                                .query_map([], |row| {
+                                    let name: String = row.get(0)?;
+
+                                    // snippets?
+                                    Ok(CompletionItem {
+                                        label: name.clone(),
+                                        insert_text: Some(name),
+                                        kind: Some(CompletionItemKind::FUNCTION),
+                                        ..Default::default()
+                                    })
+                                })
+                                .unwrap();
+
+                            // ignore errors
+                            completions.extend(rows.filter_map(|a| a.ok()));
+                        }
+
                         continue;
                     }
                     Err(not) => not,
